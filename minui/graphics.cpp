@@ -77,7 +77,7 @@ static void text_blend(unsigned char* src_p, int src_row_bytes,
                 *px++ = gr_current_r;
                 *px++ = gr_current_g;
                 *px++ = gr_current_b;
-                px++;
+                *px++ = gr_current_a;
             } else if (a > 0) {
                 *px = (*px * (255-a) + gr_current_r * a) / 255;
                 ++px;
@@ -85,6 +85,7 @@ static void text_blend(unsigned char* src_p, int src_row_bytes,
                 ++px;
                 *px = (*px * (255-a) + gr_current_b * a) / 255;
                 ++px;
+                *px = gr_current_a;
                 ++px;
             } else {
                 px += 4;

@@ -373,9 +373,44 @@ GRSurface* MinuiBackendDrm::Init() {
   return GRSurfaceDrms[0];
 }
 
+static int g_flip_ongoing = 0;
+static void page_flip_complete(int __attribute__((__unused__)) fd,
+                        unsigned int __attribute__((__unused__)) sequence,
+                        unsigned int __attribute__((__unused__)) tv_sec,
+                        unsigned int __attribute__((__unused__)) tv_usec,
+                        void *  __attribute__((__unused__)) user_data) {
+    printf("drm_flip_complete");
+    g_flip_ongoing = 0;
+}
+
 GRSurface* MinuiBackendDrm::Flip() {
-  int ret = drmModePageFlip(drm_fd, main_monitor_crtc->crtc_id,
-                            GRSurfaceDrms[current_buffer]->fb_id, 0, nullptr);
+  int ret;
+
+  drmEventContext evctx;
+  //check and wait for last flip complete
+  if (g_flip_ongoing) {
+        printf("drm_flip wait for last drm_flip complete");
+        usleep(20000);
+  }
+  g_flip_ongoing = 1;
+    
+  ret = drmModePageFlip(drm_fd, main_monitor_crtc->crtc_id,
+                            GRSurfaceDrms[current_buffer]->fb_id, DRM_MODE_PAGE_FLIP_EVENT, nullptr);
+                            
+  while (g_flip_ongoing) {
+      printf("drm_flip wait for drm_flip complete");
+      memset(&evctx, 0, sizeof evctx);
+      evctx.version = DRM_EVENT_CONTEXT_VERSION;
+      evctx.vblank_handler = NULL;
+      evctx.page_flip_handler = page_flip_complete;
+      ret = drmHandleEvent(drm_fd, &evctx);
+      if (ret != 0) {
+           printf("drmHandleEvent failed: %i\n", ret);
+          return NULL;
+      }
+      usleep(20000);
+  }
+
   if (ret < 0) {
     printf("drmModePageFlip failed ret=%d\n", ret);
     return nullptr;

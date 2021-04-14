@@ -333,7 +333,9 @@ int setup_install_mounts() {
     const Volume* v = fstab->recs + i;
 
     // We don't want to do anything with "/".
-    if (strcmp(v->mount_point, "/") == 0) {
+    // Omit umount vendor for ioc_slcand process.
+    if (strcmp(v->mount_point, "/") == 0 ||
+        strcmp(v->mount_point, "/vendor") == 0) {
       continue;
     }
 

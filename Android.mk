@@ -72,6 +72,7 @@ LOCAL_SRC_FILES := \
     adb_install.cpp \
     device.cpp \
     fuse_sdcard_provider.cpp \
+    fuse_udisk_provider.cpp \
     recovery.cpp \
     roots.cpp \
     rotate_logs.cpp \

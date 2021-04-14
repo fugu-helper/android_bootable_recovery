@@ -63,6 +63,7 @@
 #include "device.h"
 #include "error_code.h"
 #include "fuse_sdcard_provider.h"
+#include "fuse_udisk_provider.h"
 #include "fuse_sideload.h"
 #include "install.h"
 #include "minadbd/minadbd.h"
@@ -109,6 +110,8 @@ static const char *CONVERT_FBE_FILE = "/tmp/convert_fbe/convert_fbe";
 static const char *CACHE_ROOT = "/cache";
 static const char *DATA_ROOT = "/data";
 static const char *SDCARD_ROOT = "/sdcard";
+static const char *UDISK_ROOT_A = "/udiska";
+static const char *UDISK_ROOT_B = "/udiskb";
 static const char *TEMPORARY_LOG_FILE = "/tmp/recovery.log";
 static const char *TEMPORARY_INSTALL_FILE = "/tmp/last_install";
 static const char *LAST_KMSG_FILE = "/cache/recovery/last_kmsg";
@@ -378,6 +381,14 @@ static std::vector<std::string> get_args(const int argc, char** const argv) {
 // Set the BCB to reboot back into recovery (it won't resume the install from
 // sdcard though).
 static void set_sdcard_update_bootloader_message() {
+  std::vector<std::string> options;
+  std::string err;
+  if (!update_bootloader_message(options, &err)) {
+    LOG(ERROR) << "Failed to set BCB message: " << err;
+  }
+}
+
+static void set_udisk_update_bootloader_message() {
   std::vector<std::string> options;
   std::string err;
   if (!update_bootloader_message(options, &err)) {
@@ -1024,6 +1035,7 @@ static void run_graphics_test() {
 // How long (in seconds) we wait for the fuse-provided package file to
 // appear, before timing out.
 #define SDCARD_INSTALL_TIMEOUT 10
+#define UDISK_INSTALL_TIMEOUT 10
 
 static int apply_from_sdcard(Device* device, bool* wipe_cache) {
     modified_flash = true;
@@ -1100,6 +1112,127 @@ static int apply_from_sdcard(Device* device, bool* wipe_cache) {
     return result;
 }
 
+#define UDISK_NONE 0
+#define UDISK_A 1
+#define UDISK_B 2
+
+static int get_udisk_label(void) {
+    FILE *fp = NULL;
+    ssize_t size;
+    size_t len = 0;
+    char *line = NULL;
+
+    fp = fopen("/proc/partitions", "r");
+    if (fp != NULL) {
+        while ((size = getline(&line, &len, fp)) != -1) {
+            if (size > 0) {
+                if (strstr(line, "sda") != NULL) {
+                    fclose(fp);
+                    return UDISK_A;
+                } else if (strstr(line, "sdb") != NULL) {
+                    fclose(fp);
+                    return UDISK_B;
+                }
+            }
+        }
+
+        fclose(fp);
+        if (line) {
+            free(line);
+        }
+    }
+
+    return UDISK_NONE;
+}
+
+static int apply_from_udisk(Device* device, bool* wipe_cache) {
+    const char* udisk_root;
+    int label;
+
+    modified_flash = true;
+    label = get_udisk_label();
+
+    if (label == UDISK_A) {
+        udisk_root = UDISK_ROOT_A;
+    } else if (label == UDISK_B) {
+        udisk_root = UDISK_ROOT_B;
+    } else {
+        ui->Print("No usb stick detected.\n");
+        return INSTALL_ERROR;
+    }
+
+    if (ensure_path_mounted(udisk_root) != 0) {
+        ui->Print("\n-- Couldn't mount %s.\n", udisk_root);
+        return INSTALL_ERROR;
+    }
+
+    std::string path = browse_directory(udisk_root, device);
+    if (path.empty()) {
+        ui->Print("\n-- No package file selected.\n");
+        ensure_path_unmounted(udisk_root);
+        return INSTALL_ERROR;
+    }
+
+    ui->Print("\n-- Install %s ...\n", path.c_str());
+    set_udisk_update_bootloader_message();
+
+    // We used to use fuse in a thread as opposed to a process. Since accessing
+    // through fuse involves going from kernel to userspace to kernel, it leads
+    // to deadlock when a page fault occurs. (Bug: 26313124)
+    pid_t child;
+    if ((child = fork()) == 0) {
+        bool status = start_udisk_fuse(path.c_str());
+
+        _exit(status ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
+
+    // FUSE_SIDELOAD_HOST_PATHNAME will start to exist once the fuse in child
+    // process is ready.
+    int result = INSTALL_ERROR;
+    int status;
+    bool waited = false;
+    for (int i = 0; i < UDISK_INSTALL_TIMEOUT; ++i) {
+        if (waitpid(child, &status, WNOHANG) == -1) {
+            result = INSTALL_ERROR;
+            waited = true;
+            break;
+        }
+
+        struct stat sb;
+        if (stat(FUSE_SIDELOAD_HOST_PATHNAME, &sb) == -1) {
+            if (errno == ENOENT && i < UDISK_INSTALL_TIMEOUT-1) {
+                sleep(1);
+                continue;
+            } else {
+                LOG(ERROR) << "Timed out waiting for the fuse-provided package.";
+                result = INSTALL_ERROR;
+                kill(child, SIGKILL);
+                break;
+            }
+        }
+
+        result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
+                                 TEMPORARY_INSTALL_FILE, false, 0/*retry_count*/);
+        break;
+    }
+
+    if (!waited) {
+        // Calling stat() on this magic filename signals the fuse
+        // filesystem to shut down.
+        struct stat sb;
+        stat(FUSE_SIDELOAD_HOST_EXIT_PATHNAME, &sb);
+
+        waitpid(child, &status, 0);
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        LOG(ERROR) << "Error exit from the fuse process: " << WEXITSTATUS(status);
+    }
+
+    ensure_path_unmounted(udisk_root);
+    return result;
+}
+
 // Returns REBOOT, SHUTDOWN, or REBOOT_BOOTLOADER. Returning NO_ACTION means to take the default,
 // which is to reboot or shutdown depending on if the --shutdown_after flag was passed to recovery.
 static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
@@ -1153,13 +1286,15 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
 
       case Device::APPLY_ADB_SIDELOAD:
       case Device::APPLY_SDCARD:
+      case Device::APPLY_UDISK:
         {
-          bool adb = (chosen_action == Device::APPLY_ADB_SIDELOAD);
-          if (adb) {
+          if (chosen_action == Device::APPLY_ADB_SIDELOAD)
             status = apply_from_adb(&should_wipe_cache, TEMPORARY_INSTALL_FILE);
-          } else {
+          else if (chosen_action == Device::APPLY_SDCARD)
             status = apply_from_sdcard(device, &should_wipe_cache);
-          }
+          else if (chosen_action == Device::APPLY_UDISK)
+            status = apply_from_udisk(device, &should_wipe_cache);
+
 
           if (status == INSTALL_SUCCESS && should_wipe_cache) {
             if (!wipe_cache(false, device)) {
@@ -1174,7 +1309,12 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
           } else if (!ui->IsTextVisible()) {
             return Device::NO_ACTION;  // reboot if logs aren't visible
           } else {
-            ui->Print("\nInstall from %s complete.\n", adb ? "ADB" : "SD card");
+            if (chosen_action == Device::APPLY_ADB_SIDELOAD)
+              ui->Print("\nInstall from %s complete.\n", "ADB");
+            else if (chosen_action == Device::APPLY_SDCARD)
+              ui->Print("\nInstall from %s complete.\n", "SD card");
+            else if (chosen_action == Device::APPLY_UDISK)
+              ui->Print("\nInstall from %s complete.\n", "udisk");
           }
         }
         break;
